@@ -11,6 +11,8 @@ AI-powered insurance claims management platform with document verification, clai
 
 ## Checklist
 
+Note: Le site doit couvrir deux vues distinctes : la vue client et la vue assureur.
+
 ### Côté client
 
 - [ ] Éviter le jargon : réponse séparée en deux (réponse formelle avec renvoi à un document + réponse simplifiée et compréhensible)
