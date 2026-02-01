@@ -11,6 +11,7 @@ import json
 import logging
 
 from app.core.config import settings
+from app.services.storage_service import StorageService
 from app.services.vertex_search_service import VertexSearchService
 
 logger = logging.getLogger(__name__)
@@ -48,53 +49,253 @@ class RAGService:
         # Insurance vocabulary glossary
         self.vocabulary = self._load_vocabulary()
 
+        # Storage service (lazy init via helper to avoid hard failures)
+        self.storage_service: StorageService | None = None
+
+    def _get_storage_service(self) -> StorageService | None:
+        if self.storage_service is None:
+            try:
+                self.storage_service = StorageService()
+            except Exception as e:
+                logger.warning("Storage service init failed: %s", str(e))
+                self.storage_service = None
+        return self.storage_service
+
+    @staticmethod
+    def _public_gcs_url(gcs_uri: str) -> str | None:
+        if not gcs_uri.startswith("gs://"):
+            return None
+        parts = gcs_uri[5:].split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        return f"https://storage.googleapis.com/{parts[0]}/{parts[1]}"
+
+    async def _build_source_url(self, uri: str | None) -> str | None:
+        if not uri:
+            return None
+        uri = uri.strip()
+        if not uri:
+            return None
+        if uri.startswith("http://") or uri.startswith("https://"):
+            return uri
+        if uri.startswith("gs://"):
+            storage_service = self._get_storage_service()
+            if storage_service:
+                try:
+                    return await storage_service.get_gcs_uri_url(uri)
+                except Exception as e:
+                    logger.warning("Signed URL failed for uri=%s: %s", uri, str(e))
+            return self._public_gcs_url(uri)
+        return None
+
+    @staticmethod
+    def _format_source_label(source_info: Dict) -> str:
+        filename = source_info.get("filename") or "Document"
+        document_type = source_info.get("document_type") or "Unknown"
+        return f"{filename} ({document_type})"
+
+    @staticmethod
+    def _format_history(history: List[Dict[str, str]], max_turns: int = 12) -> str:
+        if not history:
+            return ""
+        trimmed = history[-max_turns:]
+        lines = []
+        for item in trimmed:
+            role = (item.get("role") or "").lower()
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            role_label = "User" if role == "user" else "Assistant"
+            lines.append(f"{role_label}: {content}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_followup_query(query: str) -> bool:
+        q = (query or "").lower().strip()
+        if not q:
+            return False
+        markers = [
+            "ce que tu viens de dire",
+            "tu viens de dire",
+            "explique",
+            "reformule",
+            "rephrase",
+            "repeat",
+            "again",
+            "clarify",
+            "what you said",
+            "what do you mean",
+            "in simple words",
+            "en mots simples",
+        ]
+        return any(marker in q for marker in markers)
+
+    def _build_search_query(self, query: str, history: List[Dict[str, str]]) -> str:
+        if not history or not self._is_followup_query(query):
+            return query
+
+        last_assistant = ""
+        last_user = ""
+        for item in reversed(history):
+            role = (item.get("role") or "").lower()
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "assistant" and not last_assistant:
+                last_assistant = content
+            if role == "user" and not last_user:
+                last_user = content
+            if last_assistant and last_user:
+                break
+
+        context = last_assistant or last_user
+        if not context:
+            return query
+
+        label = "Previous assistant answer" if last_assistant else "Previous user message"
+        context = " ".join(context.split())
+        if len(context) > 500:
+            context = context[:500]
+
+        return f"{query}\n\n{label}: {context}"
+
     def _load_knowledge_base(self) -> List[Dict]:
         """
         Fallback insurance knowledge base.
         Used when Vertex AI Search is not configured or returns no results.
         """
-        return [
+        general_docs = [
             {
                 "topic": "deductible",
-                "content": "A deductible is the amount you pay out of pocket before your insurance coverage kicks in. For example, if you have a $500 deductible and a claim for $2000, you pay $500 and insurance pays $1500."
+                "source": "Knowledge Base",
+                "ref": "Deductible (definition)",
+                "keywords": ["deductible", "franchise"],
+                "content": (
+                    "A deductible (franchise) is the amount you pay out of pocket before your insurance coverage kicks in. "
+                    "Example: with a $500 deductible and a $2000 claim, you pay $500 and insurance pays $1500."
+                ),
             },
             {
                 "topic": "premium",
-                "content": "An insurance premium is the amount you pay (usually monthly or annually) to keep your insurance policy active. It's like a membership fee for your coverage."
+                "source": "Knowledge Base",
+                "ref": "Premium (definition)",
+                "keywords": ["premium", "prime"],
+                "content": (
+                    "An insurance premium is the amount you pay (monthly/annually) to keep your policy active."
+                ),
             },
             {
                 "topic": "copay",
-                "content": "A copay (or copayment) is a fixed amount you pay for a covered service, typically paid at the time of service. Common for doctor visits and prescriptions."
+                "source": "Knowledge Base",
+                "ref": "Copay (definition)",
+                "keywords": ["copay", "copayment", "ticket modérateur"],
+                "content": (
+                    "A copay is a fixed amount you pay for a covered service (common for doctor visits and prescriptions)."
+                ),
             },
             {
                 "topic": "claim process",
-                "content": "The insurance claim process: 1) Submit claim with required documents, 2) Insurance reviews the claim, 3) Documents are verified, 4) Claim is approved or denied, 5) Payment is processed if approved."
-            },
-            {
-                "topic": "coverage",
-                "content": "Insurance coverage refers to the protection and benefits your policy provides. Different policies cover different events - read your policy carefully to understand what is and isn't covered."
-            },
-            {
-                "topic": "beneficiary",
-                "content": "A beneficiary is the person or entity you designate to receive insurance benefits, typically used in life insurance policies."
-            },
-            {
-                "topic": "exclusion",
-                "content": "An exclusion is a condition or circumstance that your insurance policy does not cover. Common exclusions include pre-existing conditions or intentional damage."
-            },
-            {
-                "topic": "claim denial",
-                "content": "A claim may be denied if: documents are incomplete, the incident isn't covered by your policy, you missed a filing deadline, or there are inconsistencies in your claim. You can usually appeal a denial."
+                "source": "Knowledge Base",
+                "ref": "Claim process (overview)",
+                "keywords": ["claim", "sinistre", "process", "procedure", "déclaration"],
+                "content": (
+                    "Typical claim steps: 1) Submit claim + documents, 2) Review, 3) Document verification, "
+                    "4) Approval/denial, 5) Payment if approved."
+                ),
             },
             {
                 "topic": "required documents",
-                "content": "Common required documents for claims: proof of identity, incident report (police/medical), receipts or invoices, photos of damage, proof of ownership, and completed claim forms."
+                "source": "Knowledge Base",
+                "ref": "Common claim documents",
+                "keywords": ["documents", "pièces", "justificatifs", "invoice", "facture", "photos"],
+                "content": (
+                    "Common claim documents: proof of identity, incident report (police/medical), receipts/invoices, "
+                    "photos, proof of ownership, and claim forms."
+                ),
+            },
+        ]
+
+        # --- Demo legal snippets (paraphrases, not full text) ---
+        legal_docs = [
+            {
+                "topic": "code des assurances l113-2 déclaration sinistre délai 5 jours",
+                "source": "Légifrance",
+                "ref": "Code des assurances — Art. L113-2",
+                "keywords": ["l113-2", "déclaration", "sinistre", "5 jours", "vol 2 jours", "24 heures", "obligations assuré"],
+                "content": (
+                    "Art. L113-2 (obligations de l’assuré) : l’assuré doit notamment déclarer le sinistre à l’assureur "
+                    "dès qu’il en a connaissance et au plus tard dans le délai fixé par le contrat, qui ne peut pas être "
+                    "inférieur à 5 jours ouvrés (2 jours ouvrés en cas de vol, 24h en cas de mortalité du bétail). "
+                    "Il doit aussi déclarer certaines circonstances nouvelles aggravant le risque (délai de 15 jours)."
+                ),
             },
             {
-                "topic": "claim status",
-                "content": "Claim statuses: Submitted (received but not reviewed), Under Review (being processed), Additional Info Required (need more documents), Approved (claim accepted), Rejected (claim denied), Paid (payment processed)."
-            }
+                "topic": "code des assurances l114-1 prescription biennale 2 ans",
+                "source": "Légifrance",
+                "ref": "Code des assurances — Art. L114-1",
+                "keywords": ["l114-1", "prescription", "2 ans", "biennale", "délai", "action"],
+                "content": (
+                    "Art. L114-1 (prescription) : en principe, les actions dérivant d’un contrat d’assurance sont prescrites "
+                    "par 2 ans à compter de l’événement qui y donne naissance (avec des exceptions prévues par le texte)."
+                ),
+            },
+            {
+                "topic": "code des assurances l114-2 interruption prescription lettre recommandée expert",
+                "source": "Légifrance",
+                "ref": "Code des assurances — Art. L114-2",
+                "keywords": ["l114-2", "interruption", "prescription", "lettre recommandée", "expert"],
+                "content": (
+                    "Art. L114-2 (interruption) : la prescription peut être interrompue par les causes ordinaires "
+                    "d’interruption, par la désignation d’experts après sinistre, et aussi par l’envoi d’une lettre "
+                    "recommandée (ou recommandé électronique AR) entre assuré et assureur selon l’objet (prime/indemnité)."
+                ),
+            },
+            {
+                "topic": "code des assurances l112-2 information précontractuelle garanties exclusions notice",
+                "source": "Légifrance",
+                "ref": "Code des assurances — Art. L112-2",
+                "keywords": ["l112-2", "notice", "information", "garanties", "exclusions", "fiche d'information", "prix"],
+                "content": (
+                    "Art. L112-2 (information avant contrat) : l’assureur doit fournir une fiche d’information sur le prix "
+                    "et les garanties et remettre un projet de contrat / notice décrivant précisément garanties, exclusions "
+                    "et obligations avant la conclusion du contrat."
+                ),
+            },
+            {
+                "topic": "code des assurances l112-4 exclusions déchéances caractères très apparents",
+                "source": "Légifrance",
+                "ref": "Code des assurances — Art. L112-4",
+                "keywords": ["l112-4", "exclusion", "déchéance", "nullité", "caractères très apparents"],
+                "content": (
+                    "Art. L112-4 : les clauses de police qui prévoient des nullités, des déchéances ou des exclusions "
+                    "ne sont valables que si elles sont mentionnées en caractères très apparents."
+                ),
+            },
+            {
+                "topic": "code des assurances l113-1 exclusion formelle et limitée faute intentionnelle",
+                "source": "Légifrance",
+                "ref": "Code des assurances — Art. L113-1",
+                "keywords": ["l113-1", "exclusion", "formelle", "limitée", "faute intentionnelle", "dolosive"],
+                "content": (
+                    "Art. L113-1 : en assurance de dommages, les pertes/dommages dus à des cas fortuits ou à la faute de "
+                    "l’assuré sont en principe à la charge de l’assureur, sauf exclusion formelle et limitée prévue au contrat. "
+                    "L’assureur ne répond pas des pertes/dommages provenant d’une faute intentionnelle ou dolosive de l’assuré."
+                ),
+            },
+            {
+                "topic": "code des assurances l121-1 principe indemnitaire valeur du bien franchise",
+                "source": "Légifrance",
+                "ref": "Code des assurances — Art. L121-1",
+                "keywords": ["l121-1", "indemnité", "principe indemnitaire", "valeur", "franchise"],
+                "content": (
+                    "Art. L121-1 : l’assurance de biens est un contrat d’indemnité ; l’indemnité ne peut pas dépasser "
+                    "la valeur de la chose assurée au moment du sinistre. Le contrat peut prévoir une déduction (franchise)."
+                ),
+            },
         ]
+
+        return general_docs + legal_docs
+
 
     def _load_vocabulary(self) -> Dict[str, str]:
         """Load insurance vocabulary for term definitions."""
@@ -115,7 +316,8 @@ class RAGService:
         self,
         query: str,
         user_id: str,
-        session_id: str
+        session_id: str,
+        history: Optional[List[Dict[str, str]]] = None
     ) -> Dict:
         """
         Generate a response to user query using RAG.
@@ -130,30 +332,38 @@ class RAGService:
             query: User's question
             user_id: User ID for ACL filtering
             session_id: Chat session ID for context
+            history: Recent chat history (ordered, alternating user/assistant)
 
         Returns:
             Dict with response text, sources, and metadata
         """
         try:
+            history = history or []
+            history_context = self._format_history(history)
+            search_query = self._build_search_query(query, history)
+
             # Step 1: Retrieve relevant context
             document_context, document_sources = await self._retrieve_from_vertex_search(
-                query=query,
+                query=search_query,
                 user_id=user_id
             )
 
-            # Step 2: Get fallback context from knowledge base
-            knowledge_context, knowledge_sources = await self._retrieve_from_knowledge_base(query)
+            # Step 2: Get fallback context from knowledge base only if no documents or history found
+            knowledge_context, knowledge_sources = ("", [])
+            if not document_context.strip() and not history_context.strip():
+                knowledge_context, knowledge_sources = await self._retrieve_from_knowledge_base(search_query)
 
             # Step 3: Combine contexts
             combined_context = self._combine_contexts(
                 document_context=document_context,
-                knowledge_context=knowledge_context
+                knowledge_context=knowledge_context,
+                history_context=history_context
             )
 
             all_sources = document_sources + knowledge_sources
 
             # Step 4: HALLUCINATION GATE - check if we have sufficient context
-            if not self._has_sufficient_context(document_context, knowledge_context):
+            if not self._has_sufficient_context(document_context, knowledge_context, history_context):
                 return {
                     "response": "I don't have enough information in your documents or my knowledge base to answer this question accurately. Please upload relevant documents or rephrase your question about general insurance topics.",
                     "sources": "[]",
@@ -180,7 +390,7 @@ class RAGService:
         except Exception as e:
             logger.error(f"Error generating RAG response: {str(e)}")
             return {
-                "response": "I apologize, but I encountered an error processing your question. Please try rephrasing or contact support.",
+                "response": "I apologize, but I encountered an error processing your question. Please try rephrasing or our contact support.",
                 "sources": "[]",
                 "sources_list": [],
                 "error": str(e)
@@ -190,14 +400,14 @@ class RAGService:
         self,
         query: str,
         user_id: str,
-        top_k: int = 5
-    ) -> tuple[str, List[str]]:
+        top_k: int = 12
+    ) -> tuple[str, List[Dict]]:
         """
         Retrieve relevant document chunks from Vertex AI Search.
         Results are automatically filtered by ACL based on user_id.
 
         Returns:
-            Tuple of (context_text, source_references)
+            Tuple of (context_text, source_links)
         """
         if not self.search_service or not settings.ENABLE_VERTEX_SEARCH:
             return "", []
@@ -224,18 +434,25 @@ class RAGService:
             # Build context from retrieved chunks
             context_parts = []
             sources = []
+            seen_sources = set()
 
             for i, chunk in enumerate(chunks):
                 if chunk.get("content"):
-                    source_info = chunk.get("source", {})
-                    source_ref = f"{source_info.get('filename', 'Document')} ({source_info.get('document_type', 'Unknown')})"
+                    source_info = chunk.get("source", {}) or {}
+                    source_ref = self._format_source_label(source_info)
 
                     context_parts.append(
                         f"[Source {i+1}: {source_ref}]\n{chunk['content']}"
                     )
 
-                    if source_ref not in sources:
-                        sources.append(source_ref)
+                    source_key = (source_ref, source_info.get("uri") or "")
+                    if source_key not in seen_sources:
+                        source_url = await self._build_source_url(source_info.get("uri"))
+                        sources.append({
+                            "label": source_ref,
+                            "url": source_url
+                        })
+                        seen_sources.add(source_key)
 
             context = "\n\n".join(context_parts)
             return context, sources
@@ -248,13 +465,10 @@ class RAGService:
         self,
         query: str,
         top_k: int = 3
-    ) -> tuple[str, List[str]]:
+    ) -> tuple[str, List[Dict]]:
         """
         Retrieve relevant content from the fallback knowledge base.
-        Uses simple keyword matching.
-
-        Returns:
-            Tuple of (context_text, source_references)
+        Uses simple keyword matching + optional per-doc keywords.
         """
         query_lower = query.lower()
         relevant_docs = []
@@ -262,14 +476,23 @@ class RAGService:
         for doc in self.knowledge_base:
             score = 0
 
-            # Topic match
-            if doc["topic"].lower() in query_lower:
+            topic = (doc.get("topic") or "").lower()
+            content = (doc.get("content") or "").lower()
+            keywords = [k.lower() for k in (doc.get("keywords") or [])]
+
+            # Strong topic match
+            if topic and topic in query_lower:
                 score += 10
 
-            # Keyword matching
-            keywords = doc["content"].lower().split()
+            # Keyword match (stronger than generic word match)
+            for kw in keywords:
+                if kw and kw in query_lower:
+                    score += 3
+
+            # Light word overlap (kept from your original)
+            content_words = set(content.split())
             for word in query_lower.split():
-                if len(word) > 3 and word in keywords:
+                if len(word) > 3 and word in content_words:
                     score += 1
 
             if score > 0:
@@ -278,24 +501,35 @@ class RAGService:
         # Sort by relevance
         relevant_docs.sort(reverse=True, key=lambda x: x[0])
 
-        # If no matches, return most common topics
+        # If no matches, keep your original behavior (return a few general topics)
         if not relevant_docs:
-            relevant_docs = [(0, doc) for doc in self.knowledge_base[:top_k]]
+            selected = self.knowledge_base[:top_k]
+        else:
+            selected = [doc for _, doc in relevant_docs[:top_k]]
 
-        # Build context
-        selected = [doc for _, doc in relevant_docs[:top_k]]
-        context = "\n\n".join([doc["content"] for doc in selected])
-        sources = [f"Knowledge Base: {doc['topic']}" for doc in selected]
+        context = "\n\n".join([doc["content"] for doc in selected if doc.get("content")])
+        sources = [
+            {
+                "label": f"{doc.get('source', 'Knowledge Base')}: {doc.get('ref', doc.get('topic', ''))}",
+                "url": None
+            }
+            for doc in selected
+        ]
 
         return context, sources
+
 
     def _combine_contexts(
         self,
         document_context: str,
-        knowledge_context: str
+        knowledge_context: str,
+        history_context: str
     ) -> str:
-        """Combine document and knowledge base contexts for the prompt."""
+        """Combine history, document, and knowledge base contexts for the prompt."""
         parts = []
+
+        if history_context:
+            parts.append("=== CONVERSATION HISTORY ===\n" + history_context)
 
         if document_context:
             parts.append("=== YOUR DOCUMENTS ===\n" + document_context)
@@ -305,7 +539,12 @@ class RAGService:
 
         return "\n\n".join(parts) if parts else "No relevant context found."
 
-    def _has_sufficient_context(self, document_context: str, knowledge_context: str) -> bool:
+    def _has_sufficient_context(
+        self,
+        document_context: str,
+        knowledge_context: str,
+        history_context: str
+    ) -> bool:
         """
         Check if we have sufficient context to answer.
         This is the hallucination gate - prevents model from making up answers.
@@ -313,7 +552,10 @@ class RAGService:
         # If we have document context with actual content, we're good
         if document_context and len(document_context.strip()) > 50:
             return True
-        # Knowledge base context is always available as fallback for general questions
+        # Conversation history can support follow-up questions
+        if history_context and len(history_context.strip()) > 50:
+            return True
+        # Knowledge base context is available as fallback for general questions
         if knowledge_context and len(knowledge_context.strip()) > 50:
             return True
         return False
@@ -347,7 +589,7 @@ RESPONSE GUIDELINES:
 - Be friendly, clear, and concise
 - Explain insurance terms in simple language
 - When referencing user documents, cite the source
-- For policy-specific questions without document context, advise the user to upload relevant documents or contact their insurance provider
+- For policy-specific questions without document context, advise the user to upload relevant documents or contact our support team
 - Use bullet points for lists
 - Keep responses focused and helpful"""
 
@@ -356,7 +598,7 @@ RESPONSE GUIDELINES:
 
 USER QUESTION: {query}
 
-Provide a helpful response based ONLY on the context above. If the context doesn't contain relevant information to answer the question, clearly state that and suggest the user upload relevant documents or contact their insurance provider."""
+Provide a helpful response based ONLY on the context above. If the context doesn't contain relevant information to answer the question, clearly state that and suggest the user upload relevant documents or contact our support team."""
 
         try:
             response = self.text_model.generate_content(
@@ -372,7 +614,7 @@ Provide a helpful response based ONLY on the context above. If the context doesn
 
         except Exception as e:
             logger.error(f"Gemini generation failed: {str(e)}")
-            return "I'm having trouble generating a response right now. Please try again or contact support."
+            return "I'm having trouble generating a response right now. Please try again or contact our support."
 
     def get_term_definition(self, term: str) -> Optional[str]:
         """Get definition for an insurance term from the vocabulary."""

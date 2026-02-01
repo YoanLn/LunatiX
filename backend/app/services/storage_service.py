@@ -90,3 +90,31 @@ class StorageService:
                 return f"file://{os.path.abspath(file_path)}"
             else:
                 raise Exception(f"Failed to generate file URL: {str(e)}")
+
+    async def get_gcs_uri_url(self, gcs_uri: str, expiration_minutes: int = 60) -> str:
+        """Get a signed URL for a GCS URI (gs://bucket/path)."""
+        if not gcs_uri.startswith("gs://"):
+            raise ValueError("Invalid GCS URI")
+
+        parts = gcs_uri[5:].split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError("Invalid GCS URI")
+
+        bucket_name, blob_name = parts
+
+        try:
+            bucket = self.client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+
+            url = blob.generate_signed_url(
+                expiration=expiration_minutes * 60,
+                method="GET"
+            )
+
+            return url
+
+        except Exception as e:
+            if settings.DEBUG:
+                return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+            else:
+                raise Exception(f"Failed to generate file URL: {str(e)}")

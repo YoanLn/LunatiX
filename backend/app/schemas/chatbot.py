@@ -13,9 +13,14 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class ChatSource(BaseModel):
+    label: str
+    url: Optional[str] = None
+
+
 class ChatResponse(BaseModel):
     session_id: str
     message: str
     response: str
-    sources: List[str] = []
+    sources: List[ChatSource] = []
     timestamp: datetime

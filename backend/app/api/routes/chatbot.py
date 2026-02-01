@@ -45,11 +45,29 @@ async def chat(
     user_id = current_user.user_id if current_user else settings.DEMO_USER_ID
 
     try:
+        # Load recent chat history for this session
+        history_rows = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.session_id == session_id, ChatMessage.user_id == user_id)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(12)
+            .all()
+        )
+
+        history_rows.reverse()
+        history = []
+        for row in history_rows:
+            if row.message:
+                history.append({"role": "user", "content": row.message})
+            if row.response:
+                history.append({"role": "assistant", "content": row.response})
+
         # Get AI response using RAG
         result = await rag_service.generate_response(
             query=chat_request.message,
             user_id=user_id,  # From auth token
-            session_id=session_id
+            session_id=session_id,
+            history=history
         )
 
         # Save chat message to database

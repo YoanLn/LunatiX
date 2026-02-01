@@ -7,6 +7,7 @@ Configured for EU region and sensitive insurance documents.
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.api_core.client_options import ClientOptions
 from google.protobuf import struct_pb2
+from google.protobuf.json_format import MessageToDict
 from typing import Dict, List, Optional
 import json
 import hashlib
@@ -79,6 +80,11 @@ class VertexSearchService:
         """Run a synchronous function in a thread pool to avoid blocking the event loop."""
         loop = asyncio.get_event_loop()
         return loop.run_in_executor(None, partial(func, *args, **kwargs))
+
+    @staticmethod
+    def _hash_user_id(user_id: str) -> str:
+        """Hash user_id for Discovery Engine user_info."""
+        return hashlib.sha256(user_id.encode("utf-8")).hexdigest()
 
     async def index_document(
         self,
@@ -296,6 +302,17 @@ class VertexSearchService:
                 serving_config=self.serving_config,
                 query=query,
                 page_size=page_size,
+                # Identify the end user (hashed) for personalization and logging.
+                user_info=discoveryengine.UserInfo(
+                    user_id=self._hash_user_id(user_id)
+                ),
+                # Make the search tolerant to typos and broaden queries.
+                spell_correction_spec=discoveryengine.SearchRequest.SpellCorrectionSpec(
+                    mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+                ),
+                query_expansion_spec=discoveryengine.SearchRequest.QueryExpansionSpec(
+                    condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.AUTO
+                ),
                 # Enable snippet extraction for RAG
                 content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
                     snippet_spec=discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
@@ -324,11 +341,18 @@ class VertexSearchService:
                 doc_data = {
                     "document_id": result.document.id,
                     "document_name": result.document.name,
+                    "uri": None
                 }
 
                 # Extract struct data
+                meta = {}
                 if result.document.struct_data:
-                    doc_data["metadata"] = dict(result.document.struct_data)
+                    meta = MessageToDict(result.document.struct_data)
+                doc_data["metadata"] = meta
+
+                # Store URI for metadata fallback
+                if result.document.content and getattr(result.document.content, "uri", None):
+                    doc_data["uri"] = result.document.content.uri
 
                 # Extract snippets for RAG context
                 snippets = []
@@ -408,12 +432,21 @@ class VertexSearchService:
             }
 
             # Add source citation info
-            if result.get("metadata"):
-                chunk["source"] = {
-                    "filename": result["metadata"].get("filename", "Unknown"),
-                    "document_type": result["metadata"].get("document_type", "Unknown"),
-                    "claim_id": result["metadata"].get("claim_id")
-                }
+            meta = result.get("metadata") or {}
+            uri = (result.get("uri") or "").strip()
+
+            filename = meta.get("filename")
+            if not filename and uri:
+                filename = uri.split("/")[-1]
+            if not filename:
+                filename = result.get("document_id") or "Document"
+
+            chunk["source"] = {
+                "filename": filename,
+                "document_type": meta.get("document_type") or "Unknown",
+                "claim_id": meta.get("claim_id"),
+                "uri": uri or None
+            }
 
             rag_chunks.append(chunk)
 
