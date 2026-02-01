@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from 'react'
-import { Send, Bot, User, X, MessageCircle } from 'lucide-react'
+import { Send, Bot, User, X, MessageCircle, Mic, MicOff } from 'lucide-react'
 import { chatbotApi } from '../services/api'
-import Button from './Button'
+import { useVoiceChat } from '../hooks/useVoiceChat'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -21,9 +21,61 @@ export default function ChatbotWidget() {
   const [loading, setLoading] = useState(false)
   const [sessionId] = useState(() => `session-${Date.now()}`)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const loadingRef = useRef(false)
 
-  // In a real app, this would come from authentication
-  const userId = 'demo-user'
+  const appendMessage = (role: 'user' | 'assistant', content: string) => {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1]
+      if (last && last.role === role && last.content === content) {
+        return prev
+      }
+      return [...prev, { role, content }]
+    })
+  }
+
+  const sendMessage = async (messageText: string) => {
+    const trimmed = messageText.trim()
+    if (!trimmed || loadingRef.current) return
+
+    setInput('')
+    appendMessage('user', trimmed)
+
+    try {
+      loadingRef.current = true
+      setLoading(true)
+      const response = await chatbotApi.sendMessage(trimmed, sessionId)
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: response.response,
+          sources: response.sources,
+        },
+      ])
+    } catch (err) {
+      console.error('Failed to send message:', err)
+      appendMessage('assistant', 'Sorry, I encountered an error. Please try again.')
+    } finally {
+      loadingRef.current = false
+      setLoading(false)
+    }
+  }
+
+  const {
+    status: voiceStatus,
+    error: voiceError,
+    start: startVoice,
+    stop: stopVoice,
+  } = useVoiceChat({
+    sessionId,
+    onTranscription: (role, text) => {
+      if (role === 'user') {
+        void sendMessage(text)
+      } else {
+        appendMessage(role, text)
+      }
+    },
+  })
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -35,42 +87,18 @@ export default function ChatbotWidget() {
     }
   }, [messages, isOpen])
 
-  const handleSend = async () => {
-    if (!input.trim() || loading) return
+  useEffect(() => {
+    loadingRef.current = loading
+  }, [loading])
 
-    const userMessage = input.trim()
-    setInput('')
-
-    // Add user message
-    setMessages((prev) => [...prev, { role: 'user', content: userMessage }])
-
-    try {
-      setLoading(true)
-
-      // Get AI response
-      const response = await chatbotApi.sendMessage(userId, userMessage, sessionId)
-
-      // Add assistant message
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: response.response,
-          sources: response.sources,
-        },
-      ])
-    } catch (err) {
-      console.error('Failed to send message:', err)
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: 'Sorry, I encountered an error. Please try again.',
-        },
-      ])
-    } finally {
-      setLoading(false)
+  useEffect(() => {
+    if (!isOpen && (voiceStatus === 'ready' || voiceStatus === 'connecting')) {
+      stopVoice()
     }
+  }, [isOpen, voiceStatus, stopVoice])
+
+  const handleSend = async () => {
+    await sendMessage(input)
   }
 
   const handleKeyPress = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -85,6 +113,14 @@ export default function ChatbotWidget() {
     "How long does the claims process take?",
     "What documents do I need?",
   ]
+
+  const voiceActive = voiceStatus === 'ready' || voiceStatus === 'connecting'
+  const voiceLabel =
+    voiceStatus === 'ready'
+      ? 'Listening'
+      : voiceStatus === 'connecting'
+      ? 'Connecting'
+      : 'Off'
 
   return (
     <>
@@ -197,6 +233,21 @@ export default function ChatbotWidget() {
 
           {/* Input */}
           <div className="border-t border-gray-200 p-4 bg-white rounded-b-2xl">
+            <div className="flex items-center justify-between text-xs text-gray-500 mb-2">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`inline-block w-2 h-2 rounded-full ${
+                    voiceStatus === 'ready'
+                      ? 'bg-emerald-500'
+                      : voiceStatus === 'connecting'
+                      ? 'bg-amber-500'
+                      : 'bg-gray-300'
+                  }`}
+                />
+                <span>Voice: {voiceLabel}</span>
+              </div>
+              {voiceError && <span className="text-red-500">{voiceError}</span>}
+            </div>
             <div className="flex gap-2">
               <input
                 type="text"
@@ -207,6 +258,21 @@ export default function ChatbotWidget() {
                 className="flex-1 px-4 py-2 border border-gray-300 rounded-full text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                 disabled={loading}
               />
+              <button
+                onClick={voiceActive ? stopVoice : startVoice}
+                className={`border rounded-full p-2 transition-colors ${
+                  voiceActive
+                    ? 'bg-emerald-500 text-white border-emerald-500 hover:bg-emerald-600'
+                    : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-100'
+                }`}
+                aria-label={voiceActive ? 'Stop voice' : 'Start voice'}
+              >
+                {voiceActive ? (
+                  <MicOff className="w-5 h-5" />
+                ) : (
+                  <Mic className="w-5 h-5" />
+                )}
+              </button>
               <button
                 onClick={handleSend}
                 disabled={!input.trim() || loading}
